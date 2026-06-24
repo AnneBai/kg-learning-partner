@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+
+# 基础依赖（始终需要）
+smolagents[toolkit]
+
+# 根据模型提供商选择安装：
+# pip install "smolagents[openai]"   # OpenAI 兼容 API（Kimi、OpenRouter 等）
+# pip install "smolagents[litellm]"  # LiteLLM（100+ 提供商）
