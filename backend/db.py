@@ -145,6 +145,38 @@ def save_graph(topic: str, nodes: list, edges: list) -> str:
     return graph_id
 
 
+def list_graphs(limit: int = 50) -> list[dict]:
+    """
+    获取图谱列表，按最近更新时间倒序
+
+    Args:
+        limit: 返回的最大记录数
+
+    Returns:
+        图谱摘要列表
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, topic, created_at, updated_at, node_count, edge_count
+               FROM graphs
+               ORDER BY updated_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+    return [
+        {
+            "graph_id": r["id"],
+            "topic": r["topic"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "node_count": r["node_count"],
+            "edge_count": r["edge_count"],
+        }
+        for r in rows
+    ]
+
+
 def load_graph(graph_id: str) -> Optional[dict]:
     """
     加载完整图谱数据（包含节点、边和对话历史）

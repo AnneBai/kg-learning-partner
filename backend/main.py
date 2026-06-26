@@ -16,6 +16,7 @@ from db import (
     init_db,
     save_graph,
     load_graph,
+    list_graphs,
     append_nodes,
     update_node_position,
     mark_expanded,
@@ -24,10 +25,11 @@ from db import (
 )
 from agent_engine import (
     create_agent,
-    extract_json,
     build_graph_prompt,
     build_expand_prompt,
     build_chat_prompt,
+    run_agent_json,
+    run_agent_text,
 )
 
 # 全局 Agent 实例（延迟初始化）
@@ -109,15 +111,7 @@ async def api_init_graph(req: InitGraphRequest):
     try:
         agent = get_agent()
         prompt = build_graph_prompt(req.topic.strip())
-        result = agent.run(prompt)
-
-        # 提取 JSON
-        if isinstance(result, str):
-            data = extract_json(result)
-        elif isinstance(result, dict):
-            data = result
-        else:
-            raise ValueError(f"无法解析 Agent 返回结果: {type(result)}")
+        data = run_agent_json(agent, prompt)
 
         nodes = data.get("nodes", [])
         edges = data.get("edges", [])
@@ -139,6 +133,17 @@ async def api_init_graph(req: InitGraphRequest):
             status_code=500,
             detail=f"图谱生成失败: {str(e)}"
         )
+
+
+@app.get("/api/graphs")
+async def api_list_graphs():
+    """
+    获取历史图谱列表（按最近更新时间倒序）
+
+    Returns:
+        graphs: 图谱摘要列表
+    """
+    return {"graphs": list_graphs()}
 
 
 @app.get("/api/graph/{graph_id}")
@@ -190,15 +195,7 @@ async def api_expand_node(graph_id: str, req: ExpandRequest):
             req.category,
             existing_ids
         )
-        result = agent.run(prompt)
-
-        # 提取 JSON
-        if isinstance(result, str):
-            data = extract_json(result)
-        elif isinstance(result, dict):
-            data = result
-        else:
-            raise ValueError(f"无法解析 Agent 返回结果: {type(result)}")
+        data = run_agent_json(agent, prompt)
 
         new_nodes = data.get("nodes", [])
         new_edges = data.get("edges", [])
@@ -281,11 +278,7 @@ async def api_chat(graph_id: str, req: ChatRequest):
             history,
             req.selected_node
         )
-        answer = agent.run(prompt)
-
-        # 确保 answer 是字符串
-        if not isinstance(answer, str):
-            answer = str(answer)
+        answer = run_agent_text(agent, prompt)
 
         # 持久化对话记录
         save_message(graph_id, "user", req.question, req.selected_node)

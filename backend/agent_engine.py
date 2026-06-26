@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 try:
     from smolagents import CodeAgent, WebSearchTool
+    from smolagents import utils as smolagents_utils
+    from smolagents import agents as smolagents_agents
 except ImportError:
     raise ImportError(
         'smolagents 未安装。请运行：pip install "smolagents[toolkit]"'
@@ -23,6 +25,41 @@ except ImportError:
 
 # 按需导入模型类（避免未使用的依赖报错）
 _MODEL_CLASSES = {}
+_CODE_PARSING_PATCHED = False
+
+
+def _patch_parse_code_blobs() -> None:
+    """
+    扩展 smolagents 的代码解析：当模型直接输出 JSON/文本（未包在 <code> 中）时，
+    自动转换为 final_answer(...) 调用，避免反复解析失败重试。
+    """
+    global _CODE_PARSING_PATCHED
+    if _CODE_PARSING_PATCHED:
+        return
+
+    original = smolagents_utils.parse_code_blobs
+
+    def _parse_with_fallback(text: str, code_block_tags: tuple[str, str]) -> str:
+        try:
+            return original(text, code_block_tags)
+        except ValueError:
+            cleaned = text.strip()
+            closing_tag = code_block_tags[1]
+            if closing_tag and cleaned.endswith(closing_tag):
+                cleaned = cleaned[: -len(closing_tag)].strip()
+
+            if cleaned.startswith("{"):
+                data = extract_json(cleaned)
+                return f"final_answer({json.dumps(data, ensure_ascii=False)})"
+
+            if cleaned and not cleaned.startswith(code_block_tags[0]):
+                return f"final_answer({json.dumps(cleaned, ensure_ascii=False)})"
+
+            raise
+
+    smolagents_utils.parse_code_blobs = _parse_with_fallback
+    smolagents_agents.parse_code_blobs = _parse_with_fallback
+    _CODE_PARSING_PATCHED = True
 
 
 def _get_model_class(name: str):
@@ -38,6 +75,89 @@ def _get_model_class(name: str):
             from smolagents import LiteLLMModel
             _MODEL_CLASSES[name] = LiteLLMModel
     return _MODEL_CLASSES[name]
+
+
+# ==================== 流式兼容模型包装器 ====================
+
+def _make_streaming_model(base_model_instance):
+    """
+    返回一个代理对象，将 generate() 方法替换为流式实现。
+
+    部分 OpenAI 兼容代理（如内部转发代理）只支持 SSE 流式响应，
+    非流式请求会返回原始 SSE 文本字符串，导致 response.choices 报错。
+    该包装器通过 stream=True 采集完整内容，再组装为 ChatMessage。
+    """
+    from smolagents.models import ChatMessage, TokenUsage
+
+    original_generate = base_model_instance.generate
+
+    def _streaming_generate(messages, stop_sequences=None, response_format=None,
+                             tools_to_call_from=None, **kwargs):
+        # 先尝试原始非流式调用
+        try:
+            result = original_generate(
+                messages=messages,
+                stop_sequences=stop_sequences,
+                response_format=response_format,
+                tools_to_call_from=tools_to_call_from,
+                **kwargs,
+            )
+            # 如果 result 是字符串，说明代理返回了原始 SSE 文本，需要改用流式
+            if isinstance(result, str):
+                raise ValueError("non-streaming proxy returned raw SSE string")
+            return result
+        except (AttributeError, ValueError, TypeError):
+            pass
+
+        # 回退：使用流式请求采集完整响应
+        logger.info("使用流式模式采集模型响应（代理仅支持 SSE）")
+        completion_kwargs = base_model_instance._prepare_completion_kwargs(
+            messages=messages,
+            stop_sequences=stop_sequences,
+            response_format=response_format,
+            tools_to_call_from=tools_to_call_from,
+            model=base_model_instance.model_id,
+            custom_role_conversions=base_model_instance.custom_role_conversions,
+            convert_images_to_image_urls=True,
+            **kwargs,
+        )
+
+        content_parts = []
+        input_tokens = 0
+        output_tokens = 0
+
+        for chunk in base_model_instance.client.chat.completions.create(
+            **completion_kwargs,
+            stream=True,
+            stream_options={"include_usage": True},
+        ):
+            if chunk.usage:
+                input_tokens = chunk.usage.prompt_tokens or 0
+                output_tokens = chunk.usage.completion_tokens or 0
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    content_parts.append(delta.content)
+
+        full_content = "".join(content_parts)
+
+        if stop_sequences and not base_model_instance.supports_stop_parameter:
+            from smolagents.models import remove_content_after_stop_sequences
+            full_content = remove_content_after_stop_sequences(full_content, stop_sequences)
+
+        return ChatMessage(
+            role="assistant",
+            content=full_content,
+            tool_calls=None,
+            raw=None,
+            token_usage=TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            ),
+        )
+
+    base_model_instance.generate = _streaming_generate
+    return base_model_instance
 
 
 # ==================== 配置常量 ====================
@@ -118,7 +238,10 @@ def _create_model():
         if base_url:
             kwargs["api_base"] = base_url
 
-        return ModelClass(**kwargs)
+        model_instance = ModelClass(**kwargs)
+
+        # 部分代理（如内部转发代理）只返回 SSE 流式响应，需要流式兼容包装
+        return _make_streaming_model(model_instance)
 
     # ---------- LiteLLM（100+ 提供商） ----------
     elif MODEL_PROVIDER == "litellm":
@@ -176,6 +299,8 @@ def create_agent():
             f'请运行：pip install "smolagents[{extra}]"'
         )
 
+    _patch_parse_code_blobs()
+
     agent = CodeAgent(
         tools=[WebSearchTool()],
         model=model,
@@ -184,6 +309,78 @@ def create_agent():
     )
 
     return agent
+
+
+# ==================== Agent 运行封装 ====================
+
+_CODE_AGENT_FORMAT = """
+【输出格式 - 必须严格遵守】
+1. 先用一行 `Thoughts: ...` 简述思路
+2. 再用 <code>...</code> 包裹 Python 代码，通过 final_answer() 提交结果
+3. 禁止直接输出 JSON 或 Markdown 代码块
+
+图谱任务示例：
+Thoughts: 搜索完成，提交图谱数据
+<code>
+final_answer({
+    "nodes": [{"id": "example", "label": "示例", "category": "核心概念", "description": "描述"}],
+    "edges": []
+})
+</code>
+
+对话任务示例：
+Thoughts: 已整理好回答
+<code>
+final_answer("你的回答正文")
+</code>
+"""
+
+
+def _scan_memory_for_json(agent) -> dict | None:
+    """从 Agent 记忆中扫描最近的有效图谱 JSON"""
+    for step in reversed(agent.memory.steps):
+        for attr in ("action_output", "model_output"):
+            value = getattr(step, attr, None)
+            if isinstance(value, dict) and value.get("nodes") is not None:
+                return value
+            if isinstance(value, str) and value.strip():
+                try:
+                    data = extract_json(value)
+                    if data.get("nodes") is not None:
+                        return data
+                except ValueError:
+                    continue
+    return None
+
+
+def run_agent_json(agent, prompt: str) -> dict:
+    """运行 Agent 并返回图谱 JSON（nodes + edges）"""
+    _patch_parse_code_blobs()
+    result = agent.run(prompt)
+
+    if isinstance(result, dict) and result.get("nodes") is not None:
+        return result
+    if isinstance(result, str):
+        return extract_json(result)
+
+    cached = _scan_memory_for_json(agent)
+    if cached:
+        return cached
+
+    raise ValueError(f"Agent 未返回有效图谱 JSON，结果类型: {type(result)}")
+
+
+def run_agent_text(agent, prompt: str) -> str:
+    """运行 Agent 并返回纯文本回答"""
+    _patch_parse_code_blobs()
+    result = agent.run(prompt)
+
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    if result is not None:
+        return str(result)
+
+    raise ValueError("Agent 未返回有效文本回答")
 
 
 # ==================== JSON 解析工具 ====================
@@ -256,7 +453,7 @@ def build_graph_prompt(topic: str) -> str:
 
 要求：
 1. 先使用 WebSearchTool 搜索该主题的核心知识点
-2. 生成 strictly JSON 格式输出，不要任何 Markdown 解释，只输出 JSON
+2. 搜索完成后，用 final_answer() 提交包含 nodes 和 edges 的字典
 3. 节点数量：8-12 个核心知识点
 4. 每个节点必须包含：
    - id: 英文驼峰命名（如 machineLearning）
@@ -270,7 +467,7 @@ def build_graph_prompt(topic: str) -> str:
    - relation: 中文动词（如"包含"、"应用于"、"依赖于"）
    - strength: 1-10 的整数，表示关联强度
 
-JSON 格式要求：
+JSON 数据结构示例：
 {{
   "nodes": [
     {{
@@ -292,8 +489,7 @@ JSON 格式要求：
 }}
 
 主题：{topic}
-
-请只输出 JSON，不要任何其他解释。"""
+{_CODE_AGENT_FORMAT}"""
 
 
 def build_expand_prompt(
@@ -320,7 +516,7 @@ def build_expand_prompt(
 
 要求：
 1. 先使用 WebSearchTool 搜索"{node_label}"的深入知识
-2. 生成 strictly JSON 格式输出，不要任何 Markdown 解释，只输出 JSON
+2. 搜索完成后，用 final_answer() 提交包含 nodes 和 edges 的字典
 3. 生成 4-6 个与"{node_label}"直接关联的新知识点
 4. 每个新节点必须包含：
    - id: 英文驼峰命名（必须全局唯一）
@@ -337,13 +533,12 @@ def build_expand_prompt(
 严禁重复！已有节点 ID 列表：{existing_ids_str}
 新节点的 id 绝不能与上述任何 ID 重复。
 
-JSON 格式：
+JSON 数据结构：
 {{
   "nodes": [{{"id": "...", "label": "...", "category": "...", "description": "..."}}],
   "edges": [{{"id": "...", "source": "{node_id}", "target": "...", "relation": "...", "strength": 8}}]
 }}
-
-请只输出 JSON，不要任何其他解释。"""
+{_CODE_AGENT_FORMAT}"""
 
 
 def build_chat_prompt(
@@ -389,5 +584,5 @@ def build_chat_prompt(
 2. 回答要准确、简洁、有深度
 3. 如果图谱中未覆盖用户问题的内容，明确说"建议展开【xxx】节点"来引导用户探索
 4. 如果选中节点与问题相关，优先围绕该节点展开回答
-
-请直接给出回答，不要输出 JSON。"""
+5. 用 final_answer() 提交你的回答文本
+{_CODE_AGENT_FORMAT}"""

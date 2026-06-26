@@ -3,3 +3,4 @@ node_modules
 dist
 __pycache__
 venv
+backend/kg_store.db

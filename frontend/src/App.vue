@@ -3,8 +3,8 @@
  * 知识图谱学习伙伴 - 主入口组件
  * 整体布局：左侧 Sidebar（固定 380px）+ 右侧 GraphCanvas（flex: 1）
  */
-import { ref, reactive } from 'vue';
-import type { KNode, GraphData, ChatMessage } from './types/graph';
+import { ref, reactive, onMounted } from 'vue';
+import type { KNode, GraphData, ChatMessage, GraphSummary } from './types/graph';
 import GraphCanvas from './components/GraphCanvas.vue';
 import Sidebar from './components/Sidebar.vue';
 import * as api from './api/graph';
@@ -31,6 +31,87 @@ const loading = ref(false);
 
 /** 当前主题 */
 const currentTopic = ref('');
+
+/** 历史图谱列表 */
+const graphList = ref<GraphSummary[]>([]);
+
+/** 历史列表加载中 */
+const historyLoading = ref(false);
+
+// ==================== URL 同步 ====================
+
+function syncUrl(id: string) {
+  const url = new URL(window.location.href);
+  url.searchParams.set('graph', id);
+  window.history.replaceState({}, '', url);
+}
+
+function clearUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('graph');
+  window.history.replaceState({}, '', url);
+}
+
+function getGraphIdFromUrl(): string | null {
+  return new URLSearchParams(window.location.search).get('graph');
+}
+
+// ==================== 历史图谱 ====================
+
+async function refreshGraphList() {
+  historyLoading.value = true;
+  try {
+    graphList.value = await api.listGraphs();
+  } catch {
+    // 列表加载失败不阻断主流程
+    graphList.value = [];
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+/**
+ * 加载已有图谱
+ */
+async function handleLoad(id: string, updateUrl = true) {
+  if (loading.value) return;
+  loading.value = true;
+
+  try {
+    const result = await api.getGraph(id);
+
+    graphId.value = result.graph_id;
+    currentTopic.value = result.topic;
+    graphData.nodes = result.nodes || [];
+    graphData.edges = result.edges || [];
+    messages.value = result.messages || [];
+    selectedNode.value = null;
+
+    if (updateUrl) {
+      syncUrl(id);
+    }
+
+    if (messages.value.length === 0) {
+      messages.value.push({
+        role: 'agent',
+        content: `已恢复"${result.topic}"的知识图谱，共 ${graphData.nodes.length} 个知识点，${graphData.edges.length} 条关联。`,
+      });
+    }
+  } catch (error: any) {
+    showError(error.message || '图谱加载失败');
+    clearUrl();
+  } finally {
+    loading.value = false;
+  }
+}
+
+onMounted(async () => {
+  await refreshGraphList();
+  const id = getGraphIdFromUrl();
+  if (id) {
+    await handleLoad(id, false);
+  }
+});
 
 // ==================== 错误提示 ====================
 
@@ -69,6 +150,9 @@ async function handleInit(topic: string) {
     // 清空之前的对话和选中状态
     messages.value = [];
     selectedNode.value = null;
+
+    syncUrl(result.graph_id);
+    await refreshGraphList();
 
     // 添加欢迎消息
     messages.value.push({
@@ -195,7 +279,11 @@ function handleNodeExpand(node: KNode) {
       :messages="messages"
       :loading="loading"
       :topic="currentTopic"
+      :graph-id="graphId"
+      :graph-list="graphList"
+      :history-loading="historyLoading"
       @init="handleInit"
+      @load="handleLoad"
       @expand="handleExpand"
       @chat="handleChat"
     />

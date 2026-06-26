@@ -4,7 +4,7 @@
  * 包含：主题输入、节点详情、聊天对话三个区域
  */
 import { ref, computed, nextTick, watch } from 'vue';
-import type { KNode, ChatMessage } from '../types/graph';
+import type { KNode, ChatMessage, GraphSummary } from '../types/graph';
 import { CATEGORY_STYLES } from '../types/graph';
 
 // ==================== Props & Emits ====================
@@ -18,13 +18,26 @@ interface Props {
   loading: boolean;
   /** 当前图谱主题 */
   topic?: string;
+  /** 当前图谱 ID */
+  graphId?: string | null;
+  /** 历史图谱列表 */
+  graphList?: GraphSummary[];
+  /** 历史列表加载中 */
+  historyLoading?: boolean;
 }
 
-const props = defineProps<Props>();
+const props = withDefaults(defineProps<Props>(), {
+  topic: '',
+  graphId: null,
+  graphList: () => [],
+  historyLoading: false,
+});
 
 const emit = defineEmits<{
   /** 初始化新图谱 */
   (e: 'init', topic: string): void;
+  /** 加载已有图谱 */
+  (e: 'load', graphId: string): void;
   /** 展开节点探索 */
   (e: 'expand', node: KNode): void;
   /** 发送聊天消息 */
@@ -36,6 +49,7 @@ const emit = defineEmits<{
 const topicInput = ref('');
 const chatInput = ref('');
 const chatContainerRef = ref<HTMLDivElement | null>(null);
+const historyExpanded = ref(true);
 
 // ==================== 计算属性 ====================
 
@@ -48,6 +62,30 @@ const categoryStyle = computed(() => {
 });
 
 // ==================== 方法 ====================
+
+/**
+ * 处理加载历史图谱
+ */
+function handleLoadGraph(id: string) {
+  if (props.loading || props.graphId === id) return;
+  emit('load', id);
+}
+
+/**
+ * 格式化相对时间
+ */
+function formatRelativeTime(iso: string): string {
+  const date = new Date(iso);
+  const diffMs = Date.now() - date.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return '刚刚';
+  if (diffMin < 60) return `${diffMin} 分钟前`;
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return `${diffHour} 小时前`;
+  const diffDay = Math.floor(diffHour / 24);
+  if (diffDay < 7) return `${diffDay} 天前`;
+  return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
+}
 
 /**
  * 处理"生成图谱"按钮点击
@@ -173,6 +211,33 @@ watch(
 
       <div v-if="topic" class="topic-badge">
         当前主题：{{ topic }}
+      </div>
+    </div>
+
+    <!-- 区域 1.5：历史图谱 -->
+    <div v-if="graphList.length > 0 || historyLoading" class="section history-section">
+      <button class="history-header" @click="historyExpanded = !historyExpanded">
+        <span class="history-title">📚 历史图谱</span>
+        <span class="history-count">{{ graphList.length }}</span>
+        <span class="history-toggle">{{ historyExpanded ? '▾' : '▸' }}</span>
+      </button>
+
+      <div v-show="historyExpanded" class="history-list">
+        <div v-if="historyLoading" class="history-loading">加载中...</div>
+        <button
+          v-for="item in graphList"
+          :key="item.graph_id"
+          class="history-item"
+          :class="{ active: graphId === item.graph_id }"
+          :disabled="loading"
+          @click="handleLoadGraph(item.graph_id)"
+        >
+          <div class="history-item-topic">{{ item.topic }}</div>
+          <div class="history-item-meta">
+            <span>{{ item.node_count }} 节点 · {{ item.edge_count }} 边</span>
+            <span>{{ formatRelativeTime(item.updated_at) }}</span>
+          </div>
+        </button>
       </div>
     </div>
 
@@ -421,6 +486,118 @@ watch(
   border-radius: 6px;
   font-size: 12px;
   color: rgba(255, 255, 255, 0.9);
+}
+
+/* 历史图谱区域 */
+.history-section {
+  flex-shrink: 0;
+  padding: 0;
+  background: #FAFBFC;
+}
+
+.history-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.history-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+}
+
+.history-count {
+  padding: 1px 7px;
+  background: #EEF2FF;
+  color: #4F46E5;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.history-toggle {
+  margin-left: auto;
+  font-size: 12px;
+  color: #9CA3AF;
+}
+
+.history-list {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.history-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.history-list::-webkit-scrollbar-thumb {
+  background: #D1D5DB;
+  border-radius: 2px;
+}
+
+.history-loading {
+  padding: 8px 8px;
+  font-size: 12px;
+  color: #9CA3AF;
+  text-align: center;
+}
+
+.history-item {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  background: #ffffff;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+
+.history-item:hover:not(:disabled) {
+  border-color: #C7D2FE;
+  background: #EEF2FF;
+}
+
+.history-item.active {
+  border-color: #4F46E5;
+  background: #EEF2FF;
+  box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.15);
+}
+
+.history-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.history-item-topic {
+  font-size: 13px;
+  font-weight: 500;
+  color: #111827;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.history-item-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 11px;
+  color: #9CA3AF;
 }
 
 /* 节点详情区域 */

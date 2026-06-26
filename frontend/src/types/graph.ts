@@ -50,6 +50,23 @@ export interface GraphData {
   edges: KEdge[];
 }
 
+/** 图谱摘要（历史列表项） */
+export interface GraphSummary {
+  graph_id: string;
+  topic: string;
+  created_at: string;
+  updated_at: string;
+  node_count: number;
+  edge_count: number;
+}
+
+/** 加载完整图谱返回结果 */
+export interface LoadGraphResult extends GraphData {
+  graph_id: string;
+  topic: string;
+  messages: ChatMessage[];
+}
+
 /** 聊天消息 */
 export interface ChatMessage {
   /** 消息角色 */

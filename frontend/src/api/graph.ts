@@ -4,7 +4,8 @@
  */
 
 import type {
-  GraphData,
+  GraphSummary,
+  LoadGraphResult,
   InitGraphResult,
   ExpandResult,
   ChatResult,
@@ -57,12 +58,20 @@ export async function initGraph(topic: string): Promise<InitGraphResult> {
 }
 
 /**
+ * 获取历史图谱列表
+ */
+export async function listGraphs(): Promise<GraphSummary[]> {
+  const result = await request<{ graphs: GraphSummary[] }>('/api/graphs');
+  return result.graphs;
+}
+
+/**
  * 获取完整图谱数据
  * @param id 图谱 ID
- * @returns 图谱数据（nodes 和 edges）
+ * @returns 图谱数据（含 topic、messages）
  */
-export async function getGraph(id: string): Promise<GraphData> {
-  return request<GraphData>(`/api/graph/${encodeURIComponent(id)}`);
+export async function getGraph(id: string): Promise<LoadGraphResult> {
+  return request<LoadGraphResult>(`/api/graph/${encodeURIComponent(id)}`);
 }
 
 /**
